@@ -3171,6 +3171,7 @@ function renderRecents() {
 function renderTrackRow(track, displayIndex, queue, options = {}) {
   if (!track.cover) ensureCoverFor(track);
   const reorder = !!options.reorder;
+  const reorderKind = options.reorderKind || (options.playlistId ? 'playlist' : 'library');
   const realIndex = trackIndexByPath(track.path);
   const isPlayingRow = currentTrackIndex >= 0
     && library[currentTrackIndex]
@@ -3179,7 +3180,9 @@ function renderTrackRow(track, displayIndex, queue, options = {}) {
   tr.className = 'trow' + (isPlayingRow ? ' playing' : '') + (reorder ? ' is-reorderable' : '');
   tr.dataset.path = track.path;
   if (reorder) {
-    tr.dataset.playlistIndex = String(displayIndex);
+    tr.dataset.reorderIndex = String(displayIndex);
+    tr.dataset.reorderKind = reorderKind;
+    if (options.playlistId) tr.dataset.playlistId = options.playlistId;
     tr.draggable = true;
   }
   const numCell = isPlayingRow
@@ -3201,7 +3204,7 @@ function renderTrackRow(track, displayIndex, queue, options = {}) {
     <div class="trow-more"><svg class="i" width="13" height="13"><use href="#i-more"/></svg></div>
   `;
   tr.addEventListener('click', e => {
-    if (reorder && Date.now() < playlistClickSuppressedUntil) {
+    if (reorder && Date.now() < rowClickSuppressedUntil) {
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -3213,7 +3216,7 @@ function renderTrackRow(track, displayIndex, queue, options = {}) {
     }
     playTrackByPath(track.path, queue);
   });
-  if (reorder) wirePlaylistRowDrag(tr, options.playlistId, displayIndex);
+  if (reorder) wireReorderRowDrag(tr, { kind: reorderKind, playlistId: options.playlistId, index: displayIndex });
   tr.addEventListener('contextmenu', e => {
     e.preventDefault();
     openContextMenu(e, track.path);
@@ -3233,11 +3236,19 @@ function currentLibraryTracks() {
   return sortedFilteredLibrary();
 }
 
+function canReorderLibrary() {
+  const q = ($('library-search').value || '').trim();
+  return activeFilter === 'all' && !q && (activeSort === 'date-desc' || activeSort === 'date-asc');
+}
+
 function renderLibrary() {
   const list = $('library-list');
   const empty = $('library-empty');
   const tracks = currentLibraryTracks();
-  $('library-count-label').textContent = `${library.length} ${pluralTracks(library.length)}`;
+  const reorder = canReorderLibrary();
+  const view = $('view-library');
+  if (view) view.classList.toggle('library-reorder-enabled', reorder);
+  $('library-count-label').textContent = library.length + ' ' + pluralTracks(library.length);
   if (library.length === 0) {
     list.innerHTML = '';
     list.style.height = '';
@@ -3247,7 +3258,7 @@ function renderLibrary() {
     if (!libraryVList) {
       libraryVList = createVirtualList({ listEl: list, scrollEl });
     }
-    libraryVList.setItems(tracks, (t, i, queue) => renderTrackRow(t, i, queue));
+    libraryVList.setItems(tracks, (t, i, queue) => renderTrackRow(t, i, queue, { reorder, reorderKind: 'library' }));
   }
   renderCounts();
 }
@@ -3379,10 +3390,10 @@ async function applyTrackCustomCover(path, dataUrl) {
 }
 
 
-let playlistDragState = null;
-let playlistClickSuppressedUntil = 0;
+let rowDragState = null;
+let rowClickSuppressedUntil = 0;
 
-function clearPlaylistDropIndicators() {
+function clearRowDropIndicators() {
   document.querySelectorAll('.trow.drop-before, .trow.drop-after').forEach(row => {
     row.classList.remove('drop-before', 'drop-after');
   });
@@ -3393,12 +3404,16 @@ function isCurrentQueueForPaths(paths) {
     && currentQueue.every(t => t && paths.includes(t.path));
 }
 
+function normalizedInsertIndex(fromIndex, insertIndex, lengthAfterRemove) {
+  return Math.max(0, Math.min(insertIndex > fromIndex ? insertIndex - 1 : insertIndex, lengthAfterRemove));
+}
+
 function reorderPlaylistTrack(playlistId, fromIndex, insertIndex) {
   const pl = playlists.find(p => p.id === playlistId);
   if (!pl || fromIndex < 0 || fromIndex >= pl.trackPaths.length) return;
   const oldPaths = pl.trackPaths.slice();
   const [moved] = pl.trackPaths.splice(fromIndex, 1);
-  const target = Math.max(0, Math.min(insertIndex > fromIndex ? insertIndex - 1 : insertIndex, pl.trackPaths.length));
+  const target = normalizedInsertIndex(fromIndex, insertIndex, pl.trackPaths.length);
   pl.trackPaths.splice(target, 0, moved);
   if (oldPaths.join('\n') === pl.trackPaths.join('\n')) return;
   savePlaylists();
@@ -3409,7 +3424,36 @@ function reorderPlaylistTrack(playlistId, fromIndex, insertIndex) {
   if ($('fullscreen-overlay').classList.contains('active')) updateFullscreenQueue();
 }
 
-function wirePlaylistRowDrag(row, playlistId, index) {
+function reorderLibraryTrack(fromIndex, insertIndex) {
+  if (!canReorderLibrary()) return;
+  const visibleTracks = currentLibraryTracks();
+  if (visibleTracks.length !== library.length || fromIndex < 0 || fromIndex >= visibleTracks.length) return;
+  const oldPaths = library.map(t => t.path);
+  const playingPath = currentTrackIndex >= 0 && library[currentTrackIndex] ? library[currentTrackIndex].path : null;
+  const nextVisible = visibleTracks.slice();
+  const [moved] = nextVisible.splice(fromIndex, 1);
+  const target = normalizedInsertIndex(fromIndex, insertIndex, nextVisible.length);
+  nextVisible.splice(target, 0, moved);
+  const nextLibrary = activeSort === 'date-desc' ? nextVisible.slice().reverse() : nextVisible;
+  if (oldPaths.join('\n') === nextLibrary.map(t => t.path).join('\n')) return;
+  library = nextLibrary;
+  saveLibrary();
+  currentTrackIndex = playingPath ? trackIndexByPath(playingPath) : -1;
+  if (isCurrentQueueForPaths(oldPaths)) currentQueue = library;
+  renderLibrary();
+  renderCounts();
+  refreshPlayingHighlight();
+  if ($('fullscreen-overlay').classList.contains('active')) updateFullscreenQueue();
+}
+
+function dragMatchesRow(row) {
+  if (!rowDragState) return false;
+  if (rowDragState.kind !== row.dataset.reorderKind) return false;
+  if (rowDragState.kind === 'playlist' && rowDragState.playlistId !== row.dataset.playlistId) return false;
+  return true;
+}
+
+function wireReorderRowDrag(row, { kind, playlistId, index }) {
   const handle = row.querySelector('.trow-drag');
   if (handle) handle.addEventListener('click', e => e.stopPropagation());
   row.addEventListener('dragstart', e => {
@@ -3417,8 +3461,9 @@ function wirePlaylistRowDrag(row, playlistId, index) {
       e.preventDefault();
       return;
     }
-    playlistDragState = { playlistId, fromIndex: index };
+    rowDragState = { kind, playlistId, fromIndex: index };
     row.classList.add('dragging');
+    document.body.classList.add('row-drag-active');
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', String(index));
@@ -3436,14 +3481,15 @@ function wirePlaylistRowDrag(row, playlistId, index) {
   });
   row.addEventListener('dragend', () => {
     row.classList.remove('dragging');
-    playlistDragState = null;
-    playlistClickSuppressedUntil = Date.now() + 250;
-    clearPlaylistDropIndicators();
+    rowDragState = null;
+    rowClickSuppressedUntil = Date.now() + 250;
+    document.body.classList.remove('row-drag-active');
+    clearRowDropIndicators();
   });
   row.addEventListener('dragover', e => {
-    if (!playlistDragState || playlistDragState.playlistId !== playlistId) return;
+    if (!dragMatchesRow(row)) return;
     e.preventDefault();
-    clearPlaylistDropIndicators();
+    clearRowDropIndicators();
     const rect = row.getBoundingClientRect();
     const after = e.clientY > rect.top + rect.height / 2;
     row.classList.add(after ? 'drop-after' : 'drop-before');
@@ -3454,14 +3500,17 @@ function wirePlaylistRowDrag(row, playlistId, index) {
     row.classList.remove('drop-before', 'drop-after');
   });
   row.addEventListener('drop', e => {
-    if (!playlistDragState || playlistDragState.playlistId !== playlistId) return;
+    if (!dragMatchesRow(row)) return;
     e.preventDefault();
     e.stopPropagation();
     const rect = row.getBoundingClientRect();
     const after = e.clientY > rect.top + rect.height / 2;
-    reorderPlaylistTrack(playlistId, playlistDragState.fromIndex, index + (after ? 1 : 0));
-    playlistDragState = null;
-    clearPlaylistDropIndicators();
+    const insertIndex = index + (after ? 1 : 0);
+    if (rowDragState.kind === 'playlist') reorderPlaylistTrack(playlistId, rowDragState.fromIndex, insertIndex);
+    else if (rowDragState.kind === 'library') reorderLibraryTrack(rowDragState.fromIndex, insertIndex);
+    rowDragState = null;
+    document.body.classList.remove('row-drag-active');
+    clearRowDropIndicators();
   });
 }
 
@@ -3525,7 +3574,7 @@ function renderPlaylistDetail(plId) {
     if (!playlistVList) {
       playlistVList = createVirtualList({ listEl: list, scrollEl });
     }
-    playlistVList.setItems(tracks, (t, i, queue) => renderTrackRow(t, i, queue, { reorder: true, playlistId: pl.id }));
+    playlistVList.setItems(tracks, (t, i, queue) => renderTrackRow(t, i, queue, { reorder: true, reorderKind: 'playlist', playlistId: pl.id }));
   }
 
   $('btn-pl-play').onclick = () => {
