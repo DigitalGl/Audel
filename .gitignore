@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+*.log
+release/
+CLAUDE.md
+chromium-bundle/
+yt-dlp-bundle/
+
+.git_backup_old/
