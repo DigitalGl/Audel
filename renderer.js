@@ -55,6 +55,7 @@ let settings = Object.assign({
   volume: 0.07,
   progressStyle: 'wave',
   trackMetaCompact: false,
+  downloadsAutoImportBlocked: false,
   artistCovers: {},
 }, JSON.parse(localStorage.getItem(LS.settings) || '{}'));
 if (!settings.artistCovers || typeof settings.artistCovers !== 'object' || Array.isArray(settings.artistCovers)) {
@@ -2348,7 +2349,7 @@ async function downloadYtResult(idx, btn) {
       setYtStatus(tr('downloads.yt.downloadError', { e: (res && res.error) || 'unknown' }), 'error');
       return;
     }
-    await importPaths([res.filePath]);
+    await importPaths([res.filePath], { source: 'download' });
     const doneBtn = restoreDownloadButton(actionEl, idx, 'downloads.yt.action.done', 'is-done');
     if (doneBtn) doneBtn.disabled = true;
     setYtStatus(tr('downloads.yt.downloadOk', { t: r.title }), 'ok');
@@ -2522,7 +2523,7 @@ async function downloadYmTrack(idx, btn) {
       setYmStatus(tr('downloads.yt.downloadError', { e: (res && res.error) || 'unknown' }), 'error');
       return;
     }
-    await importPaths([res.filePath]);
+    await importPaths([res.filePath], { source: 'download' });
     const doneBtn = restoreYmDownloadButton(actionEl, idx, 'downloads.yt.action.done', 'is-done');
     if (doneBtn) doneBtn.disabled = true;
     setYmStatus(tr('downloads.yt.downloadOk', { t: suggestedName }), 'ok');
@@ -2799,7 +2800,7 @@ async function processQueueItem(item) {
       item.status = 'done';
       item.percent = 100;
       item.filePath = res.filePath;
-      try { await importPaths([res.filePath]); } catch (_) { /* ignore */ }
+      try { await importPaths([res.filePath], { source: 'download' }); } catch (_) { /* ignore */ }
     }
   } catch (err) {
     queueByRequestId.delete(item.requestId);
@@ -4301,7 +4302,7 @@ function updateRepeatUI() {
 $('btn-add-files').addEventListener('click', async () => {
   const paths = await window.electronAPI.openFiles();
   if (!paths || paths.length === 0) return;
-  await importPaths(paths);
+  await importPaths(paths, { source: 'manual' });
 });
 
 $('btn-add-folder').addEventListener('click', async () => {
@@ -4309,10 +4310,10 @@ $('btn-add-folder').addEventListener('click', async () => {
   if (!folder) return;
   const paths = await window.electronAPI.scanFolder(folder);
   if (!paths || paths.length === 0) return;
-  await importPaths(paths);
+  await importPaths(paths, { source: 'manual' });
 });
 
-async function importPaths(paths) {
+async function importPaths(paths, options = {}) {
   let added = 0;
   for (const p of paths) {
     if (library.some(t => t.path === p)) continue;
@@ -4323,13 +4324,26 @@ async function importPaths(paths) {
     added++;
   }
   if (added > 0) {
+    resetTrackListRenderCaches();
     saveLibrary();
     refreshCurrentViewRows();
     renderCounts();
   }
 }
 
-// ── Mini-player navigation ──
+function resetTrackListRenderCaches() {
+  libraryVList = null;
+  favoritesVList = null;
+  playlistVList = null;
+  ['library-list', 'favorites-list', 'pl-detail-list'].forEach(id => {
+    const list = $(id);
+    if (!list) return;
+    list.innerHTML = '';
+    list.style.height = '';
+  });
+}
+
+// Mini-player navigation
 function gotoCurrentTrackInLibrary() {
   if (currentTrackIndex < 0) return;
   const track = library[currentTrackIndex];
@@ -5305,6 +5319,42 @@ function resetNowPlayingEmpty() {
   syncTray();
 }
 
+function clearListeningReportState() {
+  plEntry = null;
+  plLastTick = 0;
+  plSaveAccum = 0;
+  playLog = [];
+  try { localStorage.removeItem(LS.playLog); } catch (_) { /* ignore */ }
+}
+
+function clearWavePeaksState() {
+  Object.keys(wavePeaksCache).forEach(k => { delete wavePeaksCache[k]; });
+  try { localStorage.removeItem(LS.wavePeaks); } catch (_) { /* ignore */ }
+}
+
+function clearDownloadsSessionState() {
+  ytLastResults = [];
+  ymTracks = [];
+  downloadQueue.length = 0;
+  queueByRequestId.clear();
+  queuePaused = false;
+  const ytQuery = $('dl-yt-query');
+  if (ytQuery) ytQuery.value = '';
+  const ymUrl = $('dl-ym-url');
+  if (ymUrl) ymUrl.value = '';
+  setYtStatus(null);
+  setYmStatus(null);
+  renderYtResults([]);
+  renderYmResults([]);
+  renderQueue();
+  updateQueueTabBadge();
+  try {
+    localStorage.removeItem(LS.ytState);
+    localStorage.removeItem(LS.ymState);
+    localStorage.removeItem(LS.queue);
+  } catch (_) { /* ignore */ }
+}
+
 function clearLibrary() {
   audio.pause();
   try { audio.removeAttribute('src'); audio.load(); } catch (_) { /* ignore */ }
@@ -5316,13 +5366,16 @@ function clearLibrary() {
   recents = [];
   playlists = playlists.map(pl => ({ ...pl, trackPaths: [] }));
   Object.keys(coverCache).forEach(k => { delete coverCache[k]; });
+  clearWavePeaksState();
+  clearListeningReportState();
+  clearDownloadsSessionState();
   currentQueue = library;
   lastNowPlayingPath = null;
-  libraryVList = null;
-  favoritesVList = null;
-  playlistVList = null;
+  resetTrackListRenderCaches();
   activeArtistName = null;
   activePlaylistId = null;
+  settings.downloadsAutoImportBlocked = true;
+  saveSettings();
   saveLibrary();
   savePlaylists();
   saveRecents();
@@ -5336,7 +5389,6 @@ function clearLibrary() {
   else if (currentView === 'playlist-detail') renderPlaylistDetail(activePlaylistId);
   else if (currentView === 'report') renderReport();
 }
-
 async function deleteTrack(path) {
   const idx = trackIndexByPath(path);
   if (idx < 0) return;
@@ -5346,6 +5398,8 @@ async function deleteTrack(path) {
     return;
   }
   library.splice(idx, 1);
+  delete coverCache[path];
+  delete wavePeaksCache[path];
   if (currentTrackIndex === idx) {
     audio.pause();
     isPlaying = false;
@@ -5360,6 +5414,7 @@ async function deleteTrack(path) {
   recents = recents.filter(p => p !== path);
   playlists.forEach(pl => { pl.trackPaths = pl.trackPaths.filter(p => p !== path); });
   saveLibrary(); savePlaylists(); saveRecents();
+  resetTrackListRenderCaches();
   renderCounts();
   refreshCurrentViewRows();
   renderRecents();
@@ -6451,10 +6506,11 @@ async function restoreCovers() {
   if (currentTrackIndex >= 0) updateNowPlayingUI(library[currentTrackIndex]);
 }
 
-// On startup, pull tracks from the app's own downloads folder ("Audel Downloads")
-// and, if the user has set one, from their default folder. This keeps the library
-// in sync with both sources without requiring manual import.
+// On startup, optionally pull tracks from the app's download folders. After the
+// user clears the library, old downloaded files stay on disk but are not
+// re-imported automatically on the next launch.
 async function rescanOnBoot() {
+  if (settings.downloadsAutoImportBlocked) return;
   const folders = [];
   try {
     const downloadsDir = await window.electronAPI.getDownloadsDir();
@@ -6466,7 +6522,7 @@ async function rescanOnBoot() {
   for (const folder of folders) {
     try {
       const files = await window.electronAPI.scanFolder(folder);
-      if (files && files.length > 0) await importPaths(files);
+      if (files && files.length > 0) await importPaths(files, { source: 'boot' });
     } catch (_) { /* ignore */ }
   }
 }
