@@ -6,6 +6,8 @@ const { spawn } = require('child_process');
 const https = require('https');
 const musicMetadata = require('music-metadata');
 const NodeID3 = require('node-id3');
+let autoUpdater = null;
+try { ({ autoUpdater } = require('electron-updater')); } catch (_) { autoUpdater = null; }
 
 const APP_ID = 'com.audel.player';
 const APP_NAME = 'Audel';
@@ -164,10 +166,79 @@ function showMainWindow() {
   }
 }
 
+let updateCheckInProgress = false;
+let updateDownloadInProgress = false;
+
+function checkForUpdatesQuietly() {
+  if (!autoUpdater || !app.isPackaged || updateCheckInProgress || updateDownloadInProgress) return;
+  updateCheckInProgress = true;
+  autoUpdater.checkForUpdates().catch(err => {
+    updateCheckInProgress = false;
+    console.warn('update check failed:', err && err.message ? err.message : err);
+  });
+}
+
+function setupAutoUpdates() {
+  if (!autoUpdater || !app.isPackaged) return;
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.on('checking-for-update', () => { updateCheckInProgress = true; });
+  autoUpdater.on('update-not-available', () => { updateCheckInProgress = false; });
+  autoUpdater.on('error', err => {
+    updateCheckInProgress = false;
+    updateDownloadInProgress = false;
+    console.warn('update error:', err && err.message ? err.message : err);
+  });
+  autoUpdater.on('update-available', async info => {
+    updateCheckInProgress = false;
+    if (updateDownloadInProgress) return;
+    const version = info && info.version ? info.version : 'new';
+    const result = await dialog.showMessageBox(mainWindow || null, {
+      type: 'info',
+      buttons: ['Download', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Audel update available',
+      message: `Audel ${version} is available.`,
+      detail: 'Download the update now? After download, Audel will ask to restart and install it.',
+    });
+    if (result.response !== 0) return;
+    updateDownloadInProgress = true;
+    autoUpdater.downloadUpdate().catch(err => {
+      updateDownloadInProgress = false;
+      console.warn('update download failed:', err && err.message ? err.message : err);
+      dialog.showMessageBox(mainWindow || null, {
+        type: 'error',
+        buttons: ['OK'],
+        title: 'Audel update failed',
+        message: 'Could not download the update.',
+        detail: err && err.message ? err.message : String(err || ''),
+      }).catch(() => {});
+    });
+  });
+  autoUpdater.on('update-downloaded', async info => {
+    updateDownloadInProgress = false;
+    const version = info && info.version ? info.version : 'new';
+    const result = await dialog.showMessageBox(mainWindow || null, {
+      type: 'info',
+      buttons: ['Restart and install', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Audel update ready',
+      message: `Audel ${version} has been downloaded.`,
+      detail: 'Restart Audel now to install the update?',
+    });
+    if (result.response !== 0) return;
+    isQuitting = true;
+    autoUpdater.quitAndInstall(false, true);
+  });
+  setTimeout(checkForUpdatesQuietly, 5000);
+}
 ipcMain.handle('tray:updateState', () => ({ success: true, trayDisabled: true }));
 
 app.whenReady().then(() => {
   createWindow();
+  setupAutoUpdates();
 
   app.on('activate', function () {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
